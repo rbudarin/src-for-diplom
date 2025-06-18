@@ -1,0 +1,343 @@
+
+## Создание облачной инфраструктуры
+## Смотрим cloud-id:... folder-id: ...
+yc config list
+## Настройкая зеркала
+touch ~/.terraform
+##______________Config__________________
+provider_installation {
+  network_mirror {
+    url = "https://terraform-mirror.yandexcloud.net/"
+    include = ["registry.terraform.io/*/*"]
+  }
+  direct {
+    exclude = ["registry.terraform.io/*/*"]
+  }
+}
+##_______________________________________
+## Создаем проект:
+mkdir -p terraform/storage
+touch terraform/storage/{main.tf,variables.tf,output.tf}
+touch terraform/{backend.tf,vpc.tf,variables.tf,providers.tf}
+Смотрим структуру:
+tree ./terraform
+## Создааем сервисные аккаунты
+resource "yandex_iam_service_account" "terraform" {
+  name        = "tf-srv-account"
+  description = "Service account for Terraform"
+}
+
+resource "yandex_resourcemanager_folder_iam_binding" "editor" {
+  folder_id = var.yc_folder_id
+  role      = "editor"
+  members   = [
+    "serviceAccount:${yandex_iam_service_account.terraform.id}",
+  ]
+}
+
+resource "yandex_resourcemanager_folder_iam_binding" "storage_admin" {
+  folder_id = var.yc_folder_id
+  role      = "storage.admin"
+  members   = [
+    "serviceAccount:${yandex_iam_service_account.terraform.id}",
+  ]
+}
+### Подготовливаем s3-bucket под backend
+## Static access key for bucket
+resource "yandex_iam_service_account_static_access_key" "sa-static-key" {
+  service_account_id = yandex_iam_service_account.terraform.id
+  description        = "Static access key for Terraform backend"
+}
+
+## Create bucket
+resource "yandex_storage_bucket" "storage_bucket" {
+  bucket     = "${var.bucket_name}-${formatdate("DD.MM.YYYY", timestamp())}" 
+  access_key = yandex_iam_service_account_static_access_key.sa-static-key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa-static-key.secret_key
+  
+  default_storage_class = "STANDARD"
+  acl           = "public-read"
+  force_destroy = "true"
+  max_size      = var.bucket_max_size 
+
+
+  versioning {
+    enabled = true
+  }
+}
+## Собираем конфигурацию
+terraform init
+# Проверяем конфигурацию
+terraform validate
+# Создаем bucket под backend
+terraform apply -auto-approve
+
+
+
+# Посмотреть ключи
+terraform output -json
+---
+terraform output access_key
+terraform output secret_key
+
+# Удалить состояние 
+# rm -rf .terraform*
+
+
+
+# Сохроняем информацию для backand 
+echo -e "bucket = $(terraform output bucket_name)\naccess_key = $(terraform output access_key)\nsecret_key = $(terraform output secret_key)" > ../.backend.hcl
+
+# Подключим файл с секретами backend при инициации инфраструктуры:
+cd ../ && terraform init -backend-config=.backend.hcl
+terraform init -upgrade
+terraform apply -auto-approve
+## Смотрим наш bucket
+
+## Создаем VPC через foreach и locals
+##______________VPC______________________
+resource "yandex_vpc_network" "network" {
+  name = "main-network"
+}
+
+# Создание подсетей с использованием locals
+resource "yandex_vpc_subnet" "subnets" {
+  for_each = local.subnets
+
+  name           = "${each.key}"
+  zone           = each.value.zone
+  network_id     = yandex_vpc_network.network.id
+  v4_cidr_blocks = each.value.v4_cidr_blocks
+}
+##_______________locals___________________
+locals {
+  subnets = {
+    "subnet-a" = {
+      zone           = "ru-central1-a"
+      v4_cidr_blocks = ["192.168.1.0/24"]
+    },
+    "subnet-b" = {
+      zone           = "ru-central1-b"
+      v4_cidr_blocks = ["192.168.2.0/24"]
+    },
+    "subnet-d" = {
+      zone           = "ru-central1-d"
+      v4_cidr_blocks = ["192.168.3.0/24"]
+    }
+  }
+}
+##_______________________________________
+
+## Создаем Kubernetes кластер
+# Создаем ключ 
+ssh-keygen -t ed25519
+~/.ssh/k8s
+# Добовляем ключ
+ssh-add ~/.ssh/k8s
+
+# Смотрим созданные машины
+yc computer instance list
+________________________________________
+# Клонируем репозиторий Kubespray
+git clone https://github.com/kubernetes-sigs/kubespray.git
+cd kubespray
+
+# Создаем виртуальное пространство и Устанавливаем зависимости
+python3 -m venv ~/venv3.11
+source ~/venv3.11/bin/activate
+sudo apt install -y python3 python3-pip
+# Клонирование Kubespray
+git clone https://github.com/kubernetes-sigs/kubespray.git
+cd kubespray
+# Установка зависимостей
+pip3 install -r requirements.txt
+
+# Копируем пример инвентаря
+# cp -rfp inventory/sample inventory/mycluster
+
+# Запускаем скрипт для инвентори, который распределит ноды для k8s
+inventory.sh
+
+# проверяем доступность машин через ansible ping
+# ansible -i inventory/mycluster/inventory.ini all -m ping
+
+# Запуск развертывания Kubernetes
+# ansible-playbook -i inventory/mycluster/inventory.ini -u ubuntu --become --become-user=root cluster.yml
+________________________________________
+
+# Создаем тестовое приложение
+mkdir -p test-app
+touch test-app/{Dockerfile,index.html,nginx.conf}
+
+# Запускаем образ и проверяем
+docker run -d -p 8080:80 --name nginx rbudarin/nginx:v0.1 
+curl -i 127.0.0.1:8080
+
+# Создаем три файла Dockerfile, index.html, nginx.conf и собираем образ
+docker build -t rbudarin/nginx:v0.1 .
+# Авторизируемся в docker hub
+docker login -u rbudarin
+# Создаем ветку и заливаем туда свой конфиг
+docker push rbudarin/nginx:v0.1
+
+
+
+# Создайте манифесты для развертывания мониторинга:
+mkdir -p monitoring && cd !$
+touch values.yaml
+---
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+##_________________values___________________
+grafana:
+  enabled: true
+  adminPassword: "P@$$w0rD!23"
+  service:
+    portName: http-web
+    type: NodePort
+    nodePort: 30081
+##__________________________________________
+helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack --create-namespace -n monitoring -f values
+kubectl get svc -n monitoring kube-prometheus-stack-grafana -o wide
+kubectl describe svc -n monitoring kube-prometheus-stack-grafana
+kubectl delete ns monitoring
+---
+
+##_______________manifest___________________
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-app
+  template:
+    metadata:
+      labels:
+        app: nginx-app
+    spec:
+      containers:
+      - name: nginx
+        image: rbudarin/nginx:v0.1
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  type: NodePort
+  ports:
+  - protocol: TCP
+    port: 80
+  selector:
+    app: nginx-app
+##_______________________________________
+mkdir test-app
+cd !$
+kubectl create ns test-app
+kubectl apply -f manifest -n test-app
+
+kubectl delete ns test-app
+## через helm
+mkdir -p test-app/templates
+touch test-app{chart.yaml,values.yaml}
+touch test-app/templates/deployment.yaml
+##_______________chart___________________
+echo 'apiVersion: v2
+name: nginx-app
+description: A Helm chart for deploying Nginx test application
+version: "0.1"
+appVersion: "0.1"' >  test-app/Chart.yaml
+##_______________________________________
+##_______________values___________________
+echo 'replicaCount: 2
+app:
+  name: nginx-app
+
+image:
+  repository: rbudarin/nginx
+  tag: latest
+
+service:
+  type: NodePort
+  port: 80
+  nodePort: 30080' > test-app/values.yaml
+
+##_______________________________________
+##_______________deployment___________________
+
+echo '---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.app.name }}
+  labels:
+    app: {{ .Values.app.name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.app.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.app.name }}
+    spec:
+      containers:
+      - name: webapp-container
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.app.name }}-service
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Values.app.name }}
+  ports:
+    - protocol: TCP
+      port: 80
+      nodePort: {{ .Values.service.nodePort }}' > test-app/templates/deployment.yaml
+
+
+## Проверяем
+helm template test-app
+## Выполним проверку конструктора helm чарта:
+helm lint test-app
+## Выполним запуск на исполнение helm чарта:
+helm upgrade --install test-app test-app --set image.tag=v0.1
+## Проверим развернутые ресурсы:
+helm ls
+## Удалим развернутые helm ресурсы с кластера Kubernetes:
+helm uninstall test-app
+## Проверим что все удалилось 
+helm uninstall test-app
+
+## Создаем репозиторий 
+https://github.com/rbudarin/test-app-deploy
+## Добавим в репозиторий атрибуты доступа в Docker Hub
+Settings / Secrets and variables / Actions / Secrets / New repository secret
+DockerHub_User
+DockerHub_Password
+## Добавим в GitHub-профиль публичный ключ ssh и проверим возможность работы с ним через консоль
+ssh-keygen -t ed25519
+/home/user/.ssh/git
+
+cat ~/.ssh/git.pub
+## И добавим этот ключ в git
+GitHub / Settings / SSH and GPG keys / New SSH key
+
+## Проверяем
+ssh -T git@github.com -i ~/.ssh/git
+ssh-add ~/.ssh/git
+ssh -T git@github.com
+
+# kubectl describe pod nginx-app | grep -A5 "Containers:"
